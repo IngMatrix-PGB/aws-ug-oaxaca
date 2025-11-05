@@ -53,4 +53,4 @@ tfplan-*
 
 # Ignore temporary files
 *.tmp
-*.temp
+*.temp!environments/development/terraform.tfvars
