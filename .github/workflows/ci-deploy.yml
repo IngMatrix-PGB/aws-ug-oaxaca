@@ -250,7 +250,8 @@ jobs:
 
       - name: Skip SARIF upload (fork PR)
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        run: echo "⏭️  PR desde fork: se omite upload de SARIF por permisos."
+        run: |
+          echo "⏭️  PR desde fork: se omite upload de SARIF por permisos."
 
   # =========================================================================
   # Terraform Plan
