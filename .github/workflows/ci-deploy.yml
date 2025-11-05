@@ -37,10 +37,10 @@ on:
         type: boolean
 
 permissions:
-  id-token: write
+  id-token: write          # para OIDC
   contents: read
   pull-requests: write
-  security-events: write
+  security-events: write   # para subir SARIF cuando aplique
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
@@ -55,9 +55,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ============================
+  # =========================================================================
   # Validación
-  # ============================
+  # =========================================================================
   validate:
     name: Validate Code
     runs-on: ubuntu-latest
@@ -111,9 +111,9 @@ jobs:
             fi
           done
 
-  # ============================
-  # Init (crear ECR si falta)
-  # ============================
+  # =========================================================================
+  # Terraform init + crear ECR si falta
+  # =========================================================================
   terraform-init-only:
     name: Terraform Init (Create ECR if needed)
     runs-on: ubuntu-latest
@@ -143,7 +143,7 @@ jobs:
         run: |
           set -e
           ENV=${{ inputs.environment || 'development' }}
-          test -f environments/${ENV}/terraform.tfvars || (echo "Falta environments/${ENV}/terraform.tfvars" && exit 1)
+          test -f "environments/${ENV}/terraform.tfvars" || { echo "Falta environments/${ENV}/terraform.tfvars"; exit 1; }
           terraform apply \
             -target=module.infrastructure.aws_ecr_repository.this \
             -target=module.infrastructure.aws_ecr_lifecycle_policy.this \
@@ -151,9 +151,9 @@ jobs:
             -input=false \
             -var-file="environments/${ENV}/terraform.tfvars" || true
 
-  # ============================
-  # Build & Push
-  # ============================
+  # =========================================================================
+  # Build & Push Docker
+  # =========================================================================
   build-and-push:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
@@ -250,11 +250,11 @@ jobs:
 
       - name: Skip SARIF upload (fork PR)
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        run: 'echo "PR desde fork: se omite upload de SARIF por permisos."'
+        run: echo "⏭️  PR desde fork: se omite upload de SARIF por permisos."
 
-  # ============================
-  # Plan
-  # ============================
+  # =========================================================================
+  # Terraform Plan
+  # =========================================================================
   terraform-plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
@@ -287,6 +287,7 @@ jobs:
       - name: Terraform Plan
         id: plan
         run: |
+          set +e
           ENV=${{ inputs.environment || 'development' }}
           IMAGE_VAR=""
           if [ -n "${{ env.IMAGE_URI_DIGEST }}" ]; then
@@ -296,16 +297,16 @@ jobs:
             -input=false \
             -var-file="environments/${ENV}/terraform.tfvars" \
             $IMAGE_VAR \
-            -out=tfplan-${ENV} \
+            -out="tfplan-${ENV}" \
             -detailed-exitcode
           CODE=$?
-          echo "plan-exists=true" >> $GITHUB_OUTPUT
-          if [ $CODE -eq 1 ]; then
+          echo "plan-exists=true" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" -eq 1 ]; then
             echo "❌ Error en terraform plan"; exit 1
-          elif [ $CODE -eq 2 ]; then
-            echo "📋 Cambios detectados en el plan"
+          elif [ "$CODE" -eq 2 ]; then
+            echo "📋 Cambios detectados en el plan (exit 2)"; exit 0
           else
-            echo "✅ No hay cambios"
+            echo "✅ No hay cambios"; exit 0
           fi
 
       - name: Upload plan artifact
@@ -329,9 +330,9 @@ jobs:
             echo "- O haz push a main/develop para deploy automático"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ============================
-  # Apply
-  # ============================
+  # =========================================================================
+  # Terraform Apply
+  # =========================================================================
   terraform-apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
@@ -368,7 +369,7 @@ jobs:
       - name: Terraform Apply
         run: |
           ENV=${{ inputs.environment || 'development' }}
-          terraform apply -input=false -auto-approve tfplan-${ENV}
+          terraform apply -input=false -auto-approve "tfplan-${ENV}"
 
       - name: Get Terraform Outputs
         id: outputs
@@ -412,9 +413,9 @@ jobs:
             fi
           fi
 
-  # ============================
+  # =========================================================================
   # Destroy
-  # ============================
+  # =========================================================================
   terraform-destroy:
     name: Terraform Destroy
     runs-on: ubuntu-latest
