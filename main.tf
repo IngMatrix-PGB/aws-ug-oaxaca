@@ -51,6 +51,9 @@ module "infrastructure" {
   instance_type = var.instance_type
   docker_image  = var.docker_image
 
+  create_ecr          = false
+  ecr_repository_name = "umma-dev-aws-app"
+
   # Tags
   tags_common = var.tags_common
 }

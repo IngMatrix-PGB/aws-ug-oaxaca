@@ -6,6 +6,7 @@ terraform {
   }
 }
 
+
 # ============================================================================
 # Locals
 # ============================================================================
@@ -36,15 +37,21 @@ locals {
     cidrsubnet(var.vpc_cidr, 5, 5),
   ]
 
-  # User Data template
+  # -------- NUEVO: resolver URL del repo y la imagen por defecto --------
+  ecr_repo_url = var.create_ecr ? aws_ecr_repository.this[0].repository_url : data.aws_ecr_repository.existing[0].repository_url
+
+  default_image = "${local.ecr_repo_url}:latest"
+
+  # User Data template (nota: docker_image puede venir por var o default a :latest)
   user_data_raw = templatefile("${path.module}/user-data.sh.tmpl", {
     aws_account_id = data.aws_caller_identity.current.account_id
     aws_region     = var.region
-    ecr_repository = aws_ecr_repository.this.name
-    docker_image   = var.docker_image != "" ? var.docker_image : "${aws_ecr_repository.this.repository_url}:latest"
+    ecr_repository = var.create_ecr ? aws_ecr_repository.this[0].name : data.aws_ecr_repository.existing[0].name
+    docker_image   = var.docker_image != "" ? var.docker_image : local.default_image
   })
   user_data_b64 = base64encode(local.user_data_raw)
 }
+
 
 # ============================================================================
 # Data Sources
@@ -185,61 +192,47 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   tags = local.default_tags
 }
 
+data "aws_ecr_repository" "existing" {
+  count = var.create_ecr ? 0 : 1
+  name  = var.ecr_repository_name
+}
+
 # ============================================================================
 # ECR
 # ============================================================================
 resource "aws_ecr_repository" "this" {
-  name                 = "${local.base_name}-app"
+  count                = var.create_ecr ? 1 : 0
+  name                 = var.ecr_repository_name
   image_tag_mutability = "MUTABLE"
 
-  image_scanning_configuration {
-    scan_on_push = true
-  }
+  image_scanning_configuration { scan_on_push = true }
+  encryption_configuration { encryption_type = "AES256" }
 
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-
-  tags = merge(local.default_tags, {
-    Name = "${local.base_name}-ecr"
-  })
+  tags = merge(local.default_tags, { Name = "${local.base_name}-ecr" })
 }
 
 resource "aws_ecr_lifecycle_policy" "this" {
-  repository = aws_ecr_repository.this.name
+  count      = var.create_ecr ? 1 : 0
+  repository = aws_ecr_repository.this[0].name
 
   policy = jsonencode({
     rules = [
       {
-        # 1) Primero limpiar imágenes SIN tag viejas
         rulePriority = 1
         description  = "Expire untagged images older than 7 days"
-        selection = {
-          tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 7
-        }
-        action = {
-          type = "expire"
-        }
+        selection    = { tagStatus = "untagged", countType = "sinceImagePushed", countUnit = "days", countNumber = 7 }
+        action       = { type = "expire" }
       },
       {
-        # 2) Luego limitar el total (ANY debe ser la prioridad MÁS ALTA)
         rulePriority = 2
         description  = "Keep last 10 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 10
-        }
-        action = {
-          type = "expire"
-        }
+        selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 10 }
+        action       = { type = "expire" }
       }
     ]
   })
 }
+
 
 # ============================================================================
 # EC2
@@ -373,4 +366,3 @@ resource "aws_iam_role_policy_attachment" "rds_monitoring" {
   role       = aws_iam_role.rds_monitoring[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
 }
-

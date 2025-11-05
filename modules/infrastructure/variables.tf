@@ -64,3 +64,15 @@ variable "tags_common" {
   type        = map(string)
   default     = {}
 }
+
+variable "create_ecr" {
+  description = "Si true, crea el ECR; si false, se asume existente y solo se consulta"
+  type        = bool
+  default     = false
+}
+
+variable "ecr_repository_name" {
+  description = "Nombre del repositorio ECR (existente o a crear si create_ecr=true)"
+  type        = string
+  default     = "umma-dev-aws-app"
+}

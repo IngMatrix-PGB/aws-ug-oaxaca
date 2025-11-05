@@ -37,10 +37,10 @@ on:
         type: boolean
 
 permissions:
-  id-token: write          # para OIDC
+  id-token: write
   contents: read
   pull-requests: write
-  security-events: write   # para subir SARIF cuando aplique
+  security-events: write
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
@@ -56,7 +56,7 @@ concurrency:
 
 jobs:
   # =========================================================================
-  # Validación
+  # 0) Validación básica
   # =========================================================================
   validate:
     name: Validate Code
@@ -93,6 +93,7 @@ jobs:
           terraform_version: 1.6.6
 
       - name: Terraform Format Check
+        shell: bash
         run: |
           set -e
           CHANGED=$(terraform fmt -recursive -diff -no-color | tee /dev/stderr | wc -l)
@@ -101,21 +102,11 @@ jobs:
             exit 1
           fi
 
-      - name: Terraform Validate (all envs)
-        run: |
-          for env in development staging production; do
-            if [ -f "environments/$env/backend.hcl" ]; then
-              echo "🔍 Validando ambiente: $env"
-              terraform init -backend=false
-              terraform validate
-            fi
-          done
-
   # =========================================================================
-  # Terraform init + crear ECR si falta
+  # 1) Terraform init + TARGET ECR (y auto-import si ya existe)
   # =========================================================================
-  terraform-init-only:
-    name: Terraform Init (Create ECR if needed)
+  terraform-ecr:
+    name: Terraform (target ECR first)
     runs-on: ubuntu-latest
     needs: validate
     if: ${{ github.event_name == 'push' || inputs.action == 'deploy' || inputs.action == 'plan' }}
@@ -135,34 +126,57 @@ jobs:
           terraform_version: 1.6.6
 
       - name: Terraform Init
+        shell: bash
         run: |
           ENV=${{ inputs.environment || 'development' }}
+          test -f "environments/${ENV}/backend.hcl" || { echo "Falta environments/${ENV}/backend.hcl"; exit 1; }
           terraform init -backend-config="environments/${ENV}/backend.hcl" -upgrade
 
-      - name: Create ECR Repository (if needed)
+      - name: Ensure ECR via target (create or import)
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           ENV=${{ inputs.environment || 'development' }}
+          REPO_NAME="${{ env.ECR_REPOSITORY }}"
           test -f "environments/${ENV}/terraform.tfvars" || { echo "Falta environments/${ENV}/terraform.tfvars"; exit 1; }
+
+          # Dirección esperada en el state (módulo + recurso con count)
+          ADDR_REPO="module.infrastructure.aws_ecr_repository.this[0]"
+
+          echo "🔎 Verificando si ECR existe en AWS..."
+          if aws ecr describe-repositories --repository-names "${REPO_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "✅ ECR existe en AWS: ${REPO_NAME}"
+            # Si el recurso NO está en el state, lo importamos
+            if ! terraform state show "${ADDR_REPO}" >/dev/null 2>&1; then
+              echo "📥 Importando ECR al state: ${ADDR_REPO}"
+              terraform import "${ADDR_REPO}" "${REPO_NAME}"
+            else
+              echo "🧾 ECR ya referenciado en state."
+            fi
+          else
+            echo "🆕 ECR no existe en AWS. Se creará con -target."
+          fi
+
+          # Aplica SOLO repo y lifecycle (idempotente). Si el lifecycle no existe, se creará.
+          # Nota: si tu lifecycle también está con count: 1, la dirección es [0].
           terraform apply \
-            -target=module.infrastructure.aws_ecr_repository.this \
-            -target=module.infrastructure.aws_ecr_lifecycle_policy.this \
+            -target=module.infrastructure.aws_ecr_repository.this[0] \
+            -target=module.infrastructure.aws_ecr_lifecycle_policy.this[0] \
             -auto-approve \
             -input=false \
-            -var-file="environments/${ENV}/terraform.tfvars" || true
+            -var-file="environments/${ENV}/terraform.tfvars"
 
   # =========================================================================
-  # Build & Push Docker
+  # 2) Build & Push Docker → obtener DIGEST inmutable
   # =========================================================================
   build-and-push:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
-    needs: terraform-init-only
+    needs: terraform-ecr
     if: ${{ github.event_name == 'push' || inputs.action == 'deploy' || inputs.action == 'plan' }}
     outputs:
-      image-digest: ${{ steps.digest.outputs.digest }}
+      digest: ${{ steps.digest.outputs.digest }}
       image-uri: ${{ steps.digest.outputs.uri }}
-      image-tag: ${{ steps.meta.outputs.tags }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -174,6 +188,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify ECR repository exists
+        shell: bash
         run: |
           set -e
           aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" --region "${AWS_REGION}" >/dev/null
@@ -194,8 +209,6 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,prefix={{branch}}-
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build & push image
@@ -215,25 +228,26 @@ jobs:
 
       - name: Resolve immutable image digest
         id: digest
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          REPO="${ECR_REPOSITORY}"
+          REG="${{ steps.login-ecr.outputs.registry }}"
           sleep 5
-          IMAGE_DIGEST=$(aws ecr describe-images \
-            --repository-name "${ECR_REPOSITORY}" \
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "$REPO" \
             --image-ids imageTag=latest \
             --query 'imageDetails[0].imageDigest' \
             --output text \
-            --region "${AWS_REGION}" \
-            --max-items 1)
-          [ -n "$IMAGE_DIGEST" ] && [ "$IMAGE_DIGEST" != "None" ] && [ "$IMAGE_DIGEST" != "null" ]
-          IMAGE_URI_DIGEST="${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
-          echo "IMAGE_URI_DIGEST=${IMAGE_URI_DIGEST}" >> $GITHUB_ENV
-          echo "IMAGE_URI_DIGEST=${IMAGE_URI_DIGEST}" >> $GITHUB_OUTPUT
-          echo "digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
-          echo "uri=${IMAGE_URI_DIGEST}" >> $GITHUB_OUTPUT
-          echo "✅ Imagen por digest: ${IMAGE_URI_DIGEST}"
+            --region "${AWS_REGION}")
+          [ -n "$DIGEST" ] && [ "$DIGEST" != "None" ] && [ "$DIGEST" != "null" ]
+          URI_DIGEST="${REG}/${REPO}@${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "uri=${URI_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_URI_DIGEST=${URI_DIGEST}" >> "$GITHUB_ENV"
+          echo "✅ Imagen por digest: ${URI_DIGEST}"
 
-      - name: Security Scan
+      - name: Security Scan (Trivy)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.digest.outputs.digest }}
@@ -241,8 +255,7 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
 
-      # Subir SARIF solo cuando NO es PR desde fork
-      - name: Upload Trivy results
+      - name: Upload Trivy results (only if not fork PR)
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -250,11 +263,10 @@ jobs:
 
       - name: Skip SARIF upload (fork PR)
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        run: |
-          echo "⏭️  PR desde fork: se omite upload de SARIF por permisos."
+        run: echo "⏭️  PR desde fork: se omite upload de SARIF por permisos."
 
   # =========================================================================
-  # Terraform Plan
+  # 3) Terraform Plan (pasa -var docker_image con el DIGEST)
   # =========================================================================
   terraform-plan:
     name: Terraform Plan
@@ -263,7 +275,7 @@ jobs:
     if: ${{ github.event_name == 'push' || inputs.action == 'plan' || inputs.action == 'deploy' }}
     environment: ${{ inputs.environment || 'development' }}
     outputs:
-      plan-exists: ${{ steps.plan.outputs['plan-exists'] }}
+      plan_exists: ${{ steps.plan.outputs.plan_exists }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -281,58 +293,42 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init
+        shell: bash
         run: |
           ENV=${{ inputs.environment || 'development' }}
           terraform init -backend-config="environments/${ENV}/backend.hcl" -upgrade
 
       - name: Terraform Plan
         id: plan
+        shell: bash
         run: |
           set +e
           ENV=${{ inputs.environment || 'development' }}
-          IMAGE_VAR=""
-          if [ -n "${{ env.IMAGE_URI_DIGEST }}" ]; then
-            IMAGE_VAR="-var docker_image=${{ env.IMAGE_URI_DIGEST }}"
-          fi
+          IMG="${{ needs.build-and-push.outputs.image-uri }}"
           terraform plan \
             -input=false \
             -var-file="environments/${ENV}/terraform.tfvars" \
-            $IMAGE_VAR \
+            -var "docker_image=${IMG}" \
             -out="tfplan-${ENV}" \
             -detailed-exitcode
           CODE=$?
-          echo "plan-exists=true" >> "$GITHUB_OUTPUT"
-          if [ "$CODE" -eq 1 ]; then
+          echo "plan_exists=true" >> "$GITHUB_OUTPUT"
+          if [ $CODE -eq 1 ]; then
             echo "❌ Error en terraform plan"; exit 1
-          elif [ "$CODE" -eq 2 ]; then
-            echo "📋 Cambios detectados en el plan (exit 2)"; exit 0
           else
-            echo "✅ No hay cambios"; exit 0
+            exit 0
           fi
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
-        if: steps.plan.outputs['plan-exists'] == 'true'
+        if: steps.plan.outputs.plan_exists == 'true'
         with:
           name: tfplan-${{ inputs.environment || 'development' }}
           path: tfplan-${{ inputs.environment || 'development' }}
           retention-days: 7
 
-      - name: Plan Summary
-        run: |
-          ENV=${{ inputs.environment || 'development' }}
-          {
-            echo "## 📋 Terraform Plan - ${ENV}"
-            echo ""
-            echo "✅ Plan generado exitosamente"
-            echo ""
-            echo "**Para aplicar estos cambios:**"
-            echo "- Usa el workflow dispatch con action=deploy"
-            echo "- O haz push a main/develop para deploy automático"
-          } >> "$GITHUB_STEP_SUMMARY"
-
   # =========================================================================
-  # Terraform Apply
+  # 4) Terraform Apply (crea EC2/RDS/VPC; EC2 hace pull del digest)
   # =========================================================================
   terraform-apply:
     name: Terraform Apply
@@ -363,17 +359,20 @@ jobs:
           path: .
 
       - name: Terraform Init
+        shell: bash
         run: |
           ENV=${{ inputs.environment || 'development' }}
           terraform init -backend-config="environments/${ENV}/backend.hcl"
 
       - name: Terraform Apply
+        shell: bash
         run: |
           ENV=${{ inputs.environment || 'development' }}
           terraform apply -input=false -auto-approve "tfplan-${ENV}"
 
       - name: Get Terraform Outputs
         id: outputs
+        shell: bash
         run: |
           echo "ec2_ip=$(terraform output -raw ec2_public_ip 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
           echo "ec2_dns=$(terraform output -raw ec2_public_dns 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
@@ -381,12 +380,13 @@ jobs:
           echo "ecr_repo=$(terraform output -raw ecr_repository_url 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
 
       - name: Deployment Summary
+        shell: bash
         run: |
           {
             echo "## ✅ Deployment completado - ${{ inputs.environment || 'development' }}"
             echo ""
             echo "### 📦 Imagen Docker"
-            echo "- **Digest**: \`${{ env.IMAGE_URI_DIGEST }}\`"
+            echo "- **Digest**: \`${{ needs.build-and-push.outputs.image-uri }}\`"
             echo ""
             echo "### 🖥️ Infraestructura"
             echo "- **EC2 IP**: ${{ steps.outputs.outputs.ec2_ip }}"
@@ -400,6 +400,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Health Check
+        shell: bash
         run: |
           EC2_IP="${{ steps.outputs.outputs.ec2_ip }}"
           if [ "$EC2_IP" != "N/A" ] && [ -n "$EC2_IP" ]; then
@@ -415,7 +416,7 @@ jobs:
           fi
 
   # =========================================================================
-  # Destroy
+  # 5) Destroy (opcional)
   # =========================================================================
   terraform-destroy:
     name: Terraform Destroy
@@ -425,29 +426,27 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
-
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.6.6
-
       - name: Terraform Init
+        shell: bash
         run: |
           ENV=${{ inputs.environment || 'development' }}
           terraform init -backend-config="environments/${ENV}/backend.hcl"
-
       - name: Terraform Destroy
+        shell: bash
         run: |
           ENV=${{ inputs.environment || 'development' }}
           terraform destroy -auto-approve -input=false -var-file="environments/${ENV}/terraform.tfvars"
-
       - name: Cleanup Summary
+        shell: bash
         run: |
           {
             echo "## 🧹 Cleanup completado - ${{ inputs.environment || 'development' }}"
