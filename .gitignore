@@ -11,7 +11,7 @@ tfplan*
 
 # credenciales/vars
 *.tfvars
-environments/**/terraform.tfvars
+
 
 # IDE/OS
 .vscode/
