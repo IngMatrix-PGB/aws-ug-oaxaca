@@ -5,13 +5,17 @@ on:
     branches: [main, develop]
     paths:
       - 'docker/**'
-      - 'terraform/**'
+      - '**.tf'
+      - 'modules/**'
+      - 'environments/**'
       - '.github/workflows/**'
   pull_request:
     branches: [main]
     paths:
       - 'docker/**'
-      - 'terraform/**'
+      - '**.tf'
+      - 'modules/**'
+      - 'environments/**'
   workflow_dispatch:
     inputs:
       environment:
@@ -67,7 +71,7 @@ jobs:
           dockerfile: docker/Dockerfile
           failure-threshold: warning
 
-      # ---------- Opción A: ShellCheck instalado directamente ----------
+      # Opción A: instalar ShellCheck directamente
       - name: Lint Shell Scripts (ShellCheck)
         shell: bash
         run: |
@@ -83,27 +87,24 @@ jobs:
           shellcheck --version
           shellcheck -S warning "${files[@]}"
 
-      - name: Validate Terraform
+      - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.6.6
 
       - name: Terraform Format Check
         run: |
-          cd terraform
-          terraform fmt -check -recursive
-          if [ $? -ne 0 ]; then
+          terraform fmt -check -recursive || {
             echo "❌ Terraform no está formateado. Ejecuta: terraform fmt -recursive"
             exit 1
-          fi
+          }
 
-      - name: Terraform Validate
+      - name: Terraform Validate (all envs)
         run: |
-          cd terraform
           for env in development staging production; do
             if [ -f "environments/$env/backend.hcl" ]; then
               echo "🔍 Validando ambiente: $env"
-              terraform init -backend=false -backend-config="environments/$env/backend.hcl"
+              terraform init -backend=false
               terraform validate
             fi
           done
@@ -133,15 +134,11 @@ jobs:
 
       - name: Terraform Init
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
-          terraform init \
-            -backend-config="environments/${ENV}/backend.hcl" \
-            -upgrade
+          terraform init -backend-config="environments/${ENV}/backend.hcl" -upgrade
 
       - name: Create ECR Repository (if needed)
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
           terraform apply \
             -target=module.infrastructure.aws_ecr_repository.this \
@@ -221,7 +218,6 @@ jobs:
         id: digest
         run: |
           set -e
-          # Esperar a que la imagen esté disponible
           sleep 5
           IMAGE_DIGEST=$(aws ecr describe-images \
             --repository-name "${ECR_REPOSITORY}" \
@@ -266,7 +262,7 @@ jobs:
     if: ${{ github.event_name == 'push' || inputs.action == 'plan' || inputs.action == 'deploy' }}
     environment: ${{ inputs.environment || 'development' }}
     outputs:
-      plan-exists: ${{ steps.plan.outputs.plan-exists }}
+      plan-exists: ${{ steps.plan.outputs['plan-exists'] }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -284,18 +280,13 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init
-        id: init
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
-          terraform init \
-            -backend-config="environments/${ENV}/backend.hcl" \
-            -upgrade
+          terraform init -backend-config="environments/${ENV}/backend.hcl" -upgrade
 
       - name: Terraform Plan
         id: plan
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
           IMAGE_VAR=""
           if [ -n "${{ env.IMAGE_URI_DIGEST }}" ]; then
@@ -307,12 +298,11 @@ jobs:
             $IMAGE_VAR \
             -out=tfplan-${ENV} \
             -detailed-exitcode
-          PLAN_EXIT_CODE=$?
+          CODE=$?
           echo "plan-exists=true" >> $GITHUB_OUTPUT
-          if [ $PLAN_EXIT_CODE -eq 1 ]; then
-            echo "❌ Error en terraform plan"
-            exit 1
-          elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+          if [ $CODE -eq 1 ]; then
+            echo "❌ Error en terraform plan"; exit 1
+          elif [ $CODE -eq 2 ]; then
             echo "📋 Cambios detectados en el plan"
           else
             echo "✅ No hay cambios"
@@ -320,15 +310,14 @@ jobs:
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
-        if: steps.plan.outputs.plan-exists == 'true'
+        if: steps.plan.outputs['plan-exists'] == 'true'
         with:
           name: tfplan-${{ inputs.environment || 'development' }}
-          path: terraform/tfplan-${{ inputs.environment || 'development' }}
+          path: tfplan-${{ inputs.environment || 'development' }}
           retention-days: 7
 
       - name: Plan Summary
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
           {
             echo "## 📋 Terraform Plan - ${ENV}"
@@ -348,7 +337,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [terraform-plan]
     if: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')) || inputs.action == 'deploy' }}
-    environment: 
+    environment:
       name: ${{ inputs.environment || 'development' }}
     steps:
       - name: Checkout
@@ -369,26 +358,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: tfplan-${{ inputs.environment || 'development' }}
-          path: terraform/
+          path: .
 
       - name: Terraform Init
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
-          terraform init \
-            -backend-config="environments/${ENV}/backend.hcl"
+          terraform init -backend-config="environments/${ENV}/backend.hcl"
 
       - name: Terraform Apply
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
           terraform apply -input=false -auto-approve tfplan-${ENV}
 
       - name: Get Terraform Outputs
         id: outputs
         run: |
-          cd terraform
-          ENV=${{ inputs.environment || 'development' }}
           echo "ec2_ip=$(terraform output -raw ec2_public_ip 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
           echo "ec2_dns=$(terraform output -raw ec2_public_dns 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
           echo "rds_endpoint=$(terraform output -raw rds_endpoint 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
@@ -410,10 +394,7 @@ jobs:
             echo "- **ECR Repo**: ${{ steps.outputs.outputs.ecr_repo }}"
             echo ""
             echo "### 🧪 Verificación"
-            echo "Ejecuta para verificar el despliegue:"
-            echo "\`\`\`bash
-            curl -I http://${{ steps.outputs.outputs.ec2_ip }}
-            \`\`\`"
+            echo "curl -I http://${{ steps.outputs.outputs.ec2_ip }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Health Check
@@ -456,19 +437,13 @@ jobs:
 
       - name: Terraform Init
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
-          terraform init \
-            -backend-config="environments/${ENV}/backend.hcl"
+          terraform init -backend-config="environments/${ENV}/backend.hcl"
 
       - name: Terraform Destroy
         run: |
-          cd terraform
           ENV=${{ inputs.environment || 'development' }}
-          terraform destroy \
-            -auto-approve \
-            -input=false \
-            -var-file="environments/${ENV}/terraform.tfvars"
+          terraform destroy -auto-approve -input=false -var-file="environments/${ENV}/terraform.tfvars"
 
       - name: Cleanup Summary
         run: |
@@ -478,5 +453,5 @@ jobs:
             echo "- ✅ Infraestructura Terraform: **DESTRUIDA**"
             echo "- 📦 Imágenes ECR: **CONSERVADAS** (eliminar manualmente si es necesario)"
             echo ""
-            echo "⚠️ **Nota**: Los datos de RDS han sido eliminados. Asegúrate de tener backups si son necesarios."
+            echo "⚠️ Nota: Los datos de RDS han sido eliminados."
           } >> "$GITHUB_STEP_SUMMARY"
