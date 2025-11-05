@@ -189,7 +189,7 @@ resource "aws_iam_instance_profile" "ec2_profile" {
 # ECR
 # ============================================================================
 resource "aws_ecr_repository" "this" {
-  name = "${local.base_name}-app" 
+  name                 = "${local.base_name}-app"
   image_tag_mutability = "MUTABLE"
 
   image_scanning_configuration {
