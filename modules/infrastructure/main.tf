@@ -93,17 +93,17 @@ module "vpc" {
     Type = "private"
   }
 
-manage_default_network_acl = true
+  manage_default_network_acl = true
 
   default_network_acl_ingress = [
-    { rule_no = 100, action = "allow", protocol = "tcp", cidr_block = "0.0.0.0/0", from_port = 80,  to_port = 80  },
+    { rule_no = 100, action = "allow", protocol = "tcp", cidr_block = "0.0.0.0/0", from_port = 80, to_port = 80 },
     { rule_no = 110, action = "allow", protocol = "tcp", cidr_block = "0.0.0.0/0", from_port = 1024, to_port = 65535 },
-    { rule_no = 120, action = "allow", protocol = "icmp", cidr_block = "0.0.0.0/0", from_port = -1,  to_port = -1  },
+    { rule_no = 120, action = "allow", protocol = "icmp", cidr_block = "0.0.0.0/0", from_port = -1, to_port = -1 },
   ]
 
   default_network_acl_egress = [
-    { rule_no = 100, action = "allow", protocol = "tcp", cidr_block = "0.0.0.0/0", from_port = 0,   to_port = 65535 },
-    { rule_no = 110, action = "allow", protocol = "icmp", cidr_block = "0.0.0.0/0", from_port = -1,  to_port = -1  },
+    { rule_no = 100, action = "allow", protocol = "tcp", cidr_block = "0.0.0.0/0", from_port = 0, to_port = 65535 },
+    { rule_no = 110, action = "allow", protocol = "icmp", cidr_block = "0.0.0.0/0", from_port = -1, to_port = -1 },
   ]
   tags = local.default_tags
 }
