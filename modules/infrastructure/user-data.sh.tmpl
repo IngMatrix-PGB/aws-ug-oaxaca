@@ -1,0 +1,231 @@
+#!/bin/bash
+# User Data Script para EC2 - Instalación automática de Docker y despliegue
+# Generado por Terraform - NO MODIFICAR MANUALMENTE
+
+set -e
+
+# Variables de configuración
+AWS_ACCOUNT_ID="${aws_account_id}"
+AWS_REGION="${aws_region}"
+ECR_REPOSITORY="${ecr_repository}"
+DOCKER_IMAGE="${docker_image}"
+
+# Logging
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+echo " Iniciando configuración de instancia EC2 - $(date)"
+
+# Detectar el sistema operativo
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+    VER=$VERSION_ID
+else
+    echo " No se pudo detectar el sistema operativo"
+    exit 1
+fi
+
+echo " Sistema operativo detectado: $OS $VER"
+
+# Función para instalar Docker
+install_docker() {
+    case $OS in
+        "amzn"|"al2023")
+            echo " Instalando Docker en Amazon Linux..."
+            if command -v dnf &> /dev/null; then
+                # Amazon Linux 2023
+                dnf update -y
+                dnf install -y docker
+            else
+                # Amazon Linux 2
+                yum update -y
+                yum install -y docker
+            fi
+            ;;
+        "ubuntu")
+            echo " Instalando Docker en Ubuntu..."
+            apt-get update -y
+            apt-get install -y \
+                ca-certificates \
+                curl \
+                gnupg \
+                lsb-release
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+                gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            apt-get update -y
+            apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            ;;
+        *)
+            echo " Sistema operativo no soportado: $OS"
+            exit 1
+            ;;
+    esac
+}
+
+# Instalar Docker
+install_docker
+
+# Instalar AWS CLI v2 si no está instalado
+if ! command -v aws &> /dev/null; then
+    echo " Instalando AWS CLI v2..."
+    if [ "$OS" = "amzn" ] || [ "$OS" = "al2023" ]; then
+        if command -v dnf &> /dev/null; then
+            dnf install -y aws-cli
+        else
+            yum install -y aws-cli
+        fi
+    else
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip -q awscliv2.zip
+        ./aws/install
+        rm -rf aws awscliv2.zip
+    fi
+fi
+
+# Iniciar y habilitar Docker
+echo " Iniciando servicio Docker..."
+systemctl start docker
+systemctl enable docker
+
+# Verificar que Docker está funcionando
+if ! docker --version; then
+    echo " Error: Docker no se instaló correctamente"
+    exit 1
+fi
+
+echo " Docker instalado correctamente: $(docker --version)"
+
+# Esperar a que la instancia obtenga su rol IAM
+echo " Esperando a que el rol IAM esté disponible..."
+sleep 15
+
+# Autenticar con ECR usando el rol IAM de la instancia
+echo " Autenticando con ECR..."
+max_attempts=5
+attempt=1
+
+while [ $attempt -le $max_attempts ]; do
+    if aws ecr get-login-password --region $${AWS_REGION} 2>/dev/null | \
+       docker login --username AWS --password-stdin $${AWS_ACCOUNT_ID}.dkr.ecr.$${AWS_REGION}.amazonaws.com 2>/dev/null; then
+        echo " Autenticación exitosa con ECR"
+        break
+    else
+        if [ $attempt -eq $max_attempts ]; then
+            echo " Error: No se pudo autenticar con ECR después de $max_attempts intentos"
+            echo "  Verifica que el rol IAM de la instancia tiene los permisos necesarios"
+            exit 1
+        fi
+        echo "  Intento $attempt/$max_attempts fallido. Reintentando en 10 segundos..."
+        sleep 10
+        attempt=$((attempt + 1))
+    fi
+done
+
+# Hacer pull de la imagen
+echo " Descargando imagen desde ECR..."
+CONTAINER_NAME="aws-oaxaca-demo"
+max_pull_attempts=3
+pull_attempt=1
+
+while [ $pull_attempt -le $max_pull_attempts ]; do
+    if docker pull $${DOCKER_IMAGE} 2>/dev/null; then
+        echo " Imagen descargada exitosamente: $${DOCKER_IMAGE}"
+        break
+    else
+        if [ $pull_attempt -eq $max_pull_attempts ]; then
+            echo " Error: No se pudo descargar la imagen después de $max_pull_attempts intentos"
+            echo "  Imagen: $${DOCKER_IMAGE}"
+            exit 1
+        fi
+        echo "  Intento de pull $pull_attempt/$max_pull_attempts fallido. Reintentando..."
+        sleep 5
+        pull_attempt=$((pull_attempt + 1))
+    fi
+done
+
+# Detener contenedor anterior si existe
+echo " Deteniendo contenedor anterior si existe..."
+docker stop $${CONTAINER_NAME} 2>/dev/null || true
+docker rm $${CONTAINER_NAME} 2>/dev/null || true
+
+# Ejecutar el contenedor
+echo " Iniciando contenedor..."
+docker run -d \
+  --name $${CONTAINER_NAME} \
+  -p 80:80 \
+  --restart unless-stopped \
+  --log-driver json-file \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  $${DOCKER_IMAGE}
+
+# Verificar que el contenedor está corriendo
+echo "⏳ Esperando a que el contenedor inicie..."
+max_wait_attempts=12
+wait_attempt=1
+
+while [ $wait_attempt -le $max_wait_attempts ]; do
+    if docker ps | grep -q $${CONTAINER_NAME}; then
+        echo " Contenedor iniciado correctamente"
+        break
+    else
+        if [ $wait_attempt -eq $max_wait_attempts ]; then
+            echo " Error: El contenedor no se inició después de $max_wait_attempts intentos"
+            echo " Ver logs: docker logs $${CONTAINER_NAME}"
+            docker logs $${CONTAINER_NAME} 2>&1 || true
+            exit 1
+        fi
+        echo "⏳ Esperando contenedor... ($wait_attempt/$max_wait_attempts)"
+        sleep 5
+        wait_attempt=$((wait_attempt + 1))
+    fi
+done
+
+# Health check completo - verificar que la página HTML funciona
+echo " Verificando salud de la aplicación..."
+PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo 'IP_PUBLICA')
+echo " Aplicación disponible en: http://$${PUBLIC_IP}"
+
+max_health_attempts=10
+health_attempt=1
+health_success=false
+
+while [ $health_attempt -le $max_health_attempts ]; do
+    # Verificar que responde HTTP 200
+    HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" --max-time 5 http://localhost 2>/dev/null || echo "000")
+    
+    if [ "$HTTP_CODE" = "200" ]; then
+        # Verificar que el contenido HTML contiene el título esperado
+        if curl -s --max-time 5 http://localhost | grep -q "AWS User Group Oaxaca" 2>/dev/null; then
+            echo " Health check: Aplicación respondiendo correctamente (HTTP $HTTP_CODE)"
+            echo " Contenido HTML verificado: Título encontrado"
+            health_success=true
+            break
+        else
+            echo "  HTTP $HTTP_CODE pero contenido HTML no válido (intento $health_attempt/$max_health_attempts)"
+        fi
+    else
+        echo "  Health check: HTTP $HTTP_CODE (intento $health_attempt/$max_health_attempts)"
+    fi
+    
+    if [ $health_attempt -lt $max_health_attempts ]; then
+        sleep 3
+        health_attempt=$((health_attempt + 1))
+    else
+        break
+    fi
+done
+
+if [ "$health_success" = false ]; then
+    echo "  Advertencia: Health check no exitoso después de $max_health_attempts intentos"
+    echo " Ver logs del contenedor:"
+    docker logs $${CONTAINER_NAME} 2>&1 | tail -20 || true
+    echo "  La aplicación puede estar iniciando aún. Verifica manualmente en unos minutos."
+    # No salimos con error para no bloquear la inicialización completa
+    # La aplicación puede tardar un poco más en estar completamente lista
+fi
+
+echo " Configuración completada exitosamente - $(date)"

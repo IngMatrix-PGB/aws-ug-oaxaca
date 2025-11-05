@@ -1,0 +1,487 @@
+name: CI/CD - Deploy AWS Oaxaca Demo
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'docker/**'
+      - 'terraform/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - 'terraform/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente a desplegar"
+        required: true
+        default: "development"
+        type: choice
+        options: [development, staging, production]
+      action:
+        description: "Acción a ejecutar"
+        required: true
+        default: "deploy"
+        type: choice
+        options: [validate, plan, deploy, destroy]
+      skip_validation:
+        description: "Saltar validaciones (solo para emergencias)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPOSITORY: umma-dev-aws-app
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  TF_LOG: "ERROR"
+
+concurrency:
+  group: aws-oaxaca-${{ github.ref_name }}-${{ inputs.environment || 'development' }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # Validación y Tests
+  # ============================================================================
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_validation || inputs.skip_validation == false }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile
+          failure-threshold: warning
+
+      - name: Lint Shell Scripts
+        uses: azohra/shell-linter@v1.0.2
+        with:
+          path: "docker/*.sh"
+          shell: bash
+
+      - name: Validate Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform Format Check
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+          if [ $? -ne 0 ]; then
+            echo "❌ Terraform no está formateado. Ejecuta: terraform fmt -recursive"
+            exit 1
+          fi
+
+      - name: Terraform Validate
+        run: |
+          cd terraform
+          for env in development staging production; do
+            if [ -f "environments/$env/backend.hcl" ]; then
+              echo "🔍 Validando ambiente: $env"
+              terraform init -backend=false -backend-config="environments/$env/backend.hcl"
+              terraform validate
+            fi
+          done
+
+  # ============================================================================
+  # Terraform Init (para crear ECR primero si no existe)
+  # ============================================================================
+  terraform-init-only:
+    name: Terraform Init (Create ECR if needed)
+    runs-on: ubuntu-latest
+    needs: validate
+    if: ${{ github.event_name == 'push' || inputs.action == 'deploy' || inputs.action == 'plan' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          terraform init \
+            -backend-config="environments/${ENV}/backend.hcl" \
+            -upgrade
+
+      - name: Create ECR Repository (if needed)
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          
+          # Aplicar solo el recurso ECR si no existe
+          # Esto asegura que ECR esté disponible antes de build/push
+          terraform apply \
+            -target=module.infrastructure.aws_ecr_repository.this \
+            -target=module.infrastructure.aws_ecr_lifecycle_policy.this \
+            -auto-approve \
+            -input=false \
+            -var-file="environments/${ENV}/terraform.tfvars" || true
+
+  # ============================================================================
+  # Build y Push Docker Image
+  # ============================================================================
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: terraform-init-only
+    if: ${{ github.event_name == 'push' || inputs.action == 'deploy' || inputs.action == 'plan' }}
+    outputs:
+      image-digest: ${{ steps.digest.outputs.digest }}
+      image-uri: ${{ steps.digest.outputs.uri }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify ECR repository exists
+        run: |
+          set -e
+          if ! aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "❌ Error: ECR repository '${ECR_REPOSITORY}' no existe"
+            echo "⚠️  El job terraform-init-only debería haberlo creado"
+            exit 1
+          else
+            echo "✅ ECR repo existe: ${ECR_REPOSITORY}"
+          fi
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          build-args: |
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VCS_REF=${{ github.sha }}
+
+      - name: Resolve immutable image digest
+        id: digest
+        run: |
+          set -e
+          # Esperar a que la imagen esté disponible
+          sleep 5
+          
+          # Obtener el digest más reciente
+          IMAGE_DIGEST=$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag=latest \
+            --query 'imageDetails[0].imageDigest' \
+            --output text \
+            --region "${AWS_REGION}" \
+            --max-items 1)
+          
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ] || [ "$IMAGE_DIGEST" = "null" ]; then
+            echo "❌ No se pudo resolver el digest de la imagen"
+            aws ecr describe-images --repository-name "${ECR_REPOSITORY}" --region "${AWS_REGION}"
+            exit 1
+          fi
+          
+          IMAGE_URI_DIGEST="${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+          echo "IMAGE_URI_DIGEST=${IMAGE_URI_DIGEST}" >> $GITHUB_ENV
+          echo "IMAGE_URI_DIGEST=${IMAGE_URI_DIGEST}" >> $GITHUB_OUTPUT
+          echo "digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
+          echo "uri=${IMAGE_URI_DIGEST}" >> $GITHUB_OUTPUT
+          echo "✅ Imagen por digest: ${IMAGE_URI_DIGEST}"
+
+      - name: Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.digest.outputs.digest }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ============================================================================
+  # Terraform Plan
+  # ============================================================================
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: ${{ github.event_name == 'push' || inputs.action == 'plan' || inputs.action == 'deploy' }}
+    environment: ${{ inputs.environment || 'development' }}
+    outputs:
+      plan-exists: ${{ steps.plan.outputs.plan-exists }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          terraform init \
+            -backend-config="environments/${ENV}/backend.hcl" \
+            -upgrade
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          
+          # Usar imagen por digest si está disponible
+          IMAGE_VAR=""
+          if [ -n "${{ env.IMAGE_URI_DIGEST }}" ]; then
+            IMAGE_VAR="-var docker_image=${{ env.IMAGE_URI_DIGEST }}"
+          fi
+          
+          terraform plan \
+            -input=false \
+            -var-file="environments/${ENV}/terraform.tfvars" \
+            $IMAGE_VAR \
+            -out=tfplan-${ENV} \
+            -detailed-exitcode
+          
+          PLAN_EXIT_CODE=$?
+          echo "plan-exists=true" >> $GITHUB_OUTPUT
+          
+          if [ $PLAN_EXIT_CODE -eq 1 ]; then
+            echo "❌ Error en terraform plan"
+            exit 1
+          elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+            echo "📋 Cambios detectados en el plan"
+          else
+            echo "✅ No hay cambios"
+          fi
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.plan-exists == 'true'
+        with:
+          name: tfplan-${{ inputs.environment || 'development' }}
+          path: terraform/tfplan-${{ inputs.environment || 'development' }}
+          retention-days: 7
+
+      - name: Plan Summary
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          {
+            echo "## 📋 Terraform Plan - ${ENV}"
+            echo ""
+            echo "✅ Plan generado exitosamente"
+            echo ""
+            echo "**Para aplicar estos cambios:**"
+            echo "- Usa el workflow dispatch con action=deploy"
+            echo "- O haz push a main/develop para deploy automático"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================================
+  # Terraform Apply
+  # ============================================================================
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [terraform-plan]
+    if: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')) || inputs.action == 'deploy' }}
+    environment: 
+      name: ${{ inputs.environment || 'development' }}
+      # Opcional: Requiere aprobación para producción
+      # url: https://github.com/${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment || 'development' }}
+          path: terraform/
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          terraform init \
+            -backend-config="environments/${ENV}/backend.hcl"
+
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          terraform apply -input=false -auto-approve tfplan-${ENV}
+
+      - name: Get Terraform Outputs
+        id: outputs
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          echo "ec2_ip=$(terraform output -raw ec2_public_ip 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
+          echo "ec2_dns=$(terraform output -raw ec2_public_dns 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
+          echo "rds_endpoint=$(terraform output -raw rds_endpoint 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
+          echo "ecr_repo=$(terraform output -raw ecr_repository_url 2>/dev/null || echo 'N/A')" >> $GITHUB_OUTPUT
+
+      - name: Deployment Summary
+        run: |
+          {
+            echo "## ✅ Deployment completado - ${{ inputs.environment || 'development' }}"
+            echo ""
+            echo "### 📦 Imagen Docker"
+            echo "- **Digest**: \`${{ env.IMAGE_URI_DIGEST }}\`"
+            echo ""
+            echo "### 🖥️ Infraestructura"
+            echo "- **EC2 IP**: ${{ steps.outputs.outputs.ec2_ip }}"
+            echo "- **EC2 DNS**: ${{ steps.outputs.outputs.ec2_dns }}"
+            echo "- **Web**: http://${{ steps.outputs.outputs.ec2_ip }}"
+            echo "- **RDS Endpoint**: \`${{ steps.outputs.outputs.rds_endpoint }}\` (sensitive)"
+            echo "- **ECR Repo**: ${{ steps.outputs.outputs.ecr_repo }}"
+            echo ""
+            echo "### 🧪 Verificación"
+            echo "Ejecuta para verificar el despliegue:"
+            echo "\`\`\`bash"
+            echo "curl -I http://${{ steps.outputs.outputs.ec2_ip }}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Health Check
+        run: |
+          EC2_IP="${{ steps.outputs.outputs.ec2_ip }}"
+          if [ "$EC2_IP" != "N/A" ] && [ -n "$EC2_IP" ]; then
+            echo "🔍 Verificando salud de la aplicación..."
+            sleep 10
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${EC2_IP}" || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Aplicación respondiendo correctamente (HTTP $HTTP_CODE)"
+            else
+              echo "⚠️ Aplicación no responde correctamente (HTTP $HTTP_CODE)"
+              exit 1
+            fi
+          fi
+
+  # ============================================================================
+  # Destroy
+  # ============================================================================
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: ${{ inputs.action == 'destroy' }}
+    environment: ${{ inputs.environment || 'development' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          terraform init \
+            -backend-config="environments/${ENV}/backend.hcl"
+
+      - name: Terraform Destroy
+        run: |
+          cd terraform
+          ENV=${{ inputs.environment || 'development' }}
+          terraform destroy \
+            -auto-approve \
+            -input=false \
+            -var-file="environments/${ENV}/terraform.tfvars"
+
+      - name: Cleanup Summary
+        run: |
+          {
+            echo "## 🧹 Cleanup completado - ${{ inputs.environment || 'development' }}"
+            echo ""
+            echo "- ✅ Infraestructura Terraform: **DESTRUIDA**"
+            echo "- 📦 Imágenes ECR: **CONSERVADAS** (eliminar manualmente si es necesario)"
+            echo ""
+            echo "⚠️ **Nota**: Los datos de RDS han sido eliminados. Asegúrate de tener backups si son necesarios."
+          } >> "$GITHUB_STEP_SUMMARY"
+
