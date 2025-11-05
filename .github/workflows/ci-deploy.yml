@@ -94,10 +94,12 @@ jobs:
 
       - name: Terraform Format Check
         run: |
-          terraform fmt -check -recursive || {
-            echo "❌ Terraform no está formateado. Ejecuta: terraform fmt -recursive"
-            exit 1
-          }
+          set -e
+          CHANGED=$(terraform fmt -recursive -diff -no-color | tee /dev/stderr | wc -l)
+          if [ "$CHANGED" -ne 0 ]; then
+              echo "❌ Hay archivos sin formato. Ejecuta localmente: terraform fmt -recursive"
+              exit 1
+          fi
 
       - name: Terraform Validate (all envs)
         run: |
