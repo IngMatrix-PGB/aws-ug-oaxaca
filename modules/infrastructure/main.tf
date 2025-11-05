@@ -211,25 +211,27 @@ resource "aws_ecr_lifecycle_policy" "this" {
   policy = jsonencode({
     rules = [
       {
+        # 1) Primero limpiar imágenes SIN tag viejas
         rulePriority = 1
-        description  = "Keep last 10 images"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 10
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 2
         description  = "Expire untagged images older than 7 days"
         selection = {
           tagStatus   = "untagged"
           countType   = "sinceImagePushed"
           countUnit   = "days"
           countNumber = 7
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        # 2) Luego limitar el total (ANY debe ser la prioridad MÁS ALTA)
+        rulePriority = 2
+        description  = "Keep last 10 images"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 10
         }
         action = {
           type = "expire"

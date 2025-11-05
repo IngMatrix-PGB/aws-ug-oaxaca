@@ -6,7 +6,6 @@ on:
     paths:
       - 'docker/**'
       - '**.tf'
-      - '**.tfvars'
       - 'modules/**'
       - 'environments/**'
       - '.github/workflows/**'
@@ -15,7 +14,6 @@ on:
     paths:
       - 'docker/**'
       - '**.tf'
-      - '**.tfvars'
       - 'modules/**'
       - 'environments/**'
   workflow_dispatch:
@@ -42,11 +40,12 @@ permissions:
   id-token: write
   contents: read
   pull-requests: write
+  security-events: write   # <-- necesario para upload-sarif
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_REPOSITORY: umma-dev-aws-app
+  ECR_REPOSITORY: umma-dev-aws-app  # <-- correcto
   TF_IN_AUTOMATION: "1"
   TF_INPUT: "0"
   TF_LOG: "ERROR"
@@ -61,7 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !inputs.skip_validation || inputs.skip_validation == false }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Validate Dockerfile
         uses: hadolint/hadolint-action@v3.1.0
@@ -69,6 +69,7 @@ jobs:
           dockerfile: docker/Dockerfile
           failure-threshold: warning
 
+      # Lint de shell nativo (sin action externa)
       - name: Lint Shell Scripts (ShellCheck)
         shell: bash
         run: |
@@ -94,7 +95,7 @@ jobs:
           set -e
           CHANGED=$(terraform fmt -recursive -diff -no-color | tee /dev/stderr | wc -l)
           if [ "$CHANGED" -ne 0 ]; then
-            echo "❌ Hay archivos sin formato. Ejecuta: terraform fmt -recursive"
+            echo "❌ Hay archivos sin formato. Ejecuta localmente: terraform fmt -recursive"
             exit 1
           fi
 
@@ -114,16 +115,14 @@ jobs:
     needs: validate
     if: ${{ github.event_name == 'push' || inputs.action == 'deploy' || inputs.action == 'plan' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: WhoAmI (debug)
-        run: aws sts get-caller-identity
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -133,11 +132,11 @@ jobs:
       - name: Terraform Init
         run: |
           ENV=${{ inputs.environment || 'development' }}
-          test -f environments/${ENV}/backend.hcl || (echo "Falta environments/${ENV}/backend.hcl" && exit 1)
           terraform init -backend-config="environments/${ENV}/backend.hcl" -upgrade
 
       - name: Create ECR Repository (if needed)
         run: |
+          set -e
           ENV=${{ inputs.environment || 'development' }}
           test -f environments/${ENV}/terraform.tfvars || (echo "Falta environments/${ENV}/terraform.tfvars" && exit 1)
           terraform apply \
@@ -157,7 +156,8 @@ jobs:
       image-uri: ${{ steps.digest.outputs.uri }}
       image-tag: ${{ steps.meta.outputs.tags }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -217,11 +217,7 @@ jobs:
             --output text \
             --region "${AWS_REGION}" \
             --max-items 1)
-          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ] || [ "$IMAGE_DIGEST" = "null" ]; then
-            echo "❌ No se pudo resolver el digest de la imagen"
-            aws ecr describe-images --repository-name "${ECR_REPOSITORY}" --region "${AWS_REGION}"
-            exit 1
-          fi
+          [ -n "$IMAGE_DIGEST" ] && [ "$IMAGE_DIGEST" != "None" ] && [ "$IMAGE_DIGEST" != "null" ]
           IMAGE_URI_DIGEST="${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
           echo "IMAGE_URI_DIGEST=${IMAGE_URI_DIGEST}" >> $GITHUB_ENV
           echo "IMAGE_URI_DIGEST=${IMAGE_URI_DIGEST}" >> $GITHUB_OUTPUT
@@ -237,11 +233,16 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
 
+      # Subir SARIF solo cuando NO es PR desde fork, y con permisos adecuados
       - name: Upload Trivy results
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
         with:
           sarif_file: 'trivy-results.sarif'
+
+      - name: Skip SARIF upload (fork PR)
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: echo "⏭️  PR desde fork: se omite upload de SARIF por permisos."
 
   terraform-plan:
     name: Terraform Plan
@@ -250,9 +251,10 @@ jobs:
     if: ${{ github.event_name == 'push' || inputs.action == 'plan' || inputs.action == 'deploy' }}
     environment: ${{ inputs.environment || 'development' }}
     outputs:
-      plan-exists: ${{ steps.plan.outputs.plan-exists }}
+      plan-exists: ${{ steps.plan.outputs['plan-exists'] }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -297,7 +299,7 @@ jobs:
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
-        if: steps.plan.outputs.plan-exists == 'true'
+        if: steps.plan.outputs['plan-exists'] == 'true'
         with:
           name: tfplan-${{ inputs.environment || 'development' }}
           path: tfplan-${{ inputs.environment || 'development' }}
@@ -324,7 +326,8 @@ jobs:
     environment:
       name: ${{ inputs.environment || 'development' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -351,7 +354,7 @@ jobs:
       - name: Terraform Apply
         run: |
           ENV=${{ inputs.environment || 'development' }}
-          terraform apply -input=false -auto-approve tfplan-${ENV}
+          terraform apply -input=false -auto-approve tfplan-${_ENV}
 
       - name: Get Terraform Outputs
         id: outputs
@@ -373,8 +376,11 @@ jobs:
             echo "- **EC2 IP**: ${{ steps.outputs.outputs.ec2_ip }}"
             echo "- **EC2 DNS**: ${{ steps.outputs.outputs.ec2_dns }}"
             echo "- **Web**: http://${{ steps.outputs.outputs.ec2_ip }}"
-            echo "- **RDS Endpoint**: \`${{ steps.outputs.outputs.rds_endpoint }}\`"
+            echo "- **RDS Endpoint**: \`${{ steps.outputs.outputs.rds_endpoint }}\` (sensitive)"
             echo "- **ECR Repo**: ${{ steps.outputs.outputs.ecr_repo }}"
+            echo ""
+            echo "### 🧪 Verificación"
+            echo "curl -I http://${{ steps.outputs.outputs.ec2_ip }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Health Check
@@ -385,9 +391,9 @@ jobs:
             sleep 10
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${EC2_IP}" || echo "000")
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ Aplicación respondiendo correctamente (HTTP $HTTP_CODE)"
+              echo "✅ Aplicación respondiendo (HTTP $HTTP_CODE)"
             else
-              echo "⚠️ Aplicación no responde correctamente (HTTP $HTTP_CODE)"
+              echo "⚠️ Aplicación no responde (HTTP $HTTP_CODE)"
               exit 1
             fi
           fi
@@ -398,7 +404,8 @@ jobs:
     if: ${{ inputs.action == 'destroy' }}
     environment: ${{ inputs.environment || 'development' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -425,6 +432,9 @@ jobs:
         run: |
           {
             echo "## 🧹 Cleanup completado - ${{ inputs.environment || 'development' }}"
-            echo "- ✅ Infraestructura Terraform: DESTRUIDA"
-            echo "- 📦 Imágenes ECR: CONSERVADAS (eliminar manualmente si es necesario)"
+            echo ""
+            echo "- ✅ Infraestructura Terraform: **DESTRUIDA**"
+            echo "- 📦 Imágenes ECR: **CONSERVADAS** (eliminar manualmente si es necesario)"
+            echo ""
+            echo "⚠️ Nota: Los datos de RDS han sido eliminados."
           } >> "$GITHUB_STEP_SUMMARY"

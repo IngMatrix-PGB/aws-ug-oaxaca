@@ -24,16 +24,6 @@ tfplan*
 crash.log
 crash.*.log
 
-# Exclude all .tfvars files, which are likely to contain sensitive data
-*.tfvars
-*.tfvars.json
-
-# Ignore override files as they are usually used to override resources locally
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
@@ -53,4 +43,3 @@ tfplan-*
 
 # Ignore temporary files
 *.tmp
-*.temp!environments/development/terraform.tfvars
