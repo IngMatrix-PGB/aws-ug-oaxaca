@@ -9,10 +9,6 @@
 tfplan*
 *.plan
 
-# credenciales/vars
-*.tfvars
-
-
 # IDE/OS
 .vscode/
 .DS_Store
