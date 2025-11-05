@@ -81,7 +81,7 @@ module "vpc" {
   private_subnets = local.private_subnets
 
   enable_nat_gateway   = true
-  single_nat_gateway   = var.environment == "development" ? true : false # Multi-AZ para prod
+  single_nat_gateway   = var.environment == "development" ? true : false
   enable_dns_hostnames = true
   enable_dns_support   = true
 
@@ -93,6 +93,18 @@ module "vpc" {
     Type = "private"
   }
 
+manage_default_network_acl = true
+
+  default_network_acl_ingress = [
+    { rule_no = 100, action = "allow", protocol = "tcp", cidr_block = "0.0.0.0/0", from_port = 80,  to_port = 80  },
+    { rule_no = 110, action = "allow", protocol = "tcp", cidr_block = "0.0.0.0/0", from_port = 1024, to_port = 65535 },
+    { rule_no = 120, action = "allow", protocol = "icmp", cidr_block = "0.0.0.0/0", from_port = -1,  to_port = -1  },
+  ]
+
+  default_network_acl_egress = [
+    { rule_no = 100, action = "allow", protocol = "tcp", cidr_block = "0.0.0.0/0", from_port = 0,   to_port = 65535 },
+    { rule_no = 110, action = "allow", protocol = "icmp", cidr_block = "0.0.0.0/0", from_port = -1,  to_port = -1  },
+  ]
   tags = local.default_tags
 }
 
