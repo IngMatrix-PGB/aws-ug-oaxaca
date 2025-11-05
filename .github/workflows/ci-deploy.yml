@@ -40,12 +40,12 @@ permissions:
   id-token: write
   contents: read
   pull-requests: write
-  security-events: write   # <-- necesario para upload-sarif
+  security-events: write
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-  ECR_REPOSITORY: umma-dev-aws-app  # <-- correcto
+  ECR_REPOSITORY: umma-dev-aws-app
   TF_IN_AUTOMATION: "1"
   TF_INPUT: "0"
   TF_LOG: "ERROR"
@@ -55,6 +55,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ============================
+  # Validación
+  # ============================
   validate:
     name: Validate Code
     runs-on: ubuntu-latest
@@ -69,7 +72,6 @@ jobs:
           dockerfile: docker/Dockerfile
           failure-threshold: warning
 
-      # Lint de shell nativo (sin action externa)
       - name: Lint Shell Scripts (ShellCheck)
         shell: bash
         run: |
@@ -109,6 +111,9 @@ jobs:
             fi
           done
 
+  # ============================
+  # Init (crear ECR si falta)
+  # ============================
   terraform-init-only:
     name: Terraform Init (Create ECR if needed)
     runs-on: ubuntu-latest
@@ -146,6 +151,9 @@ jobs:
             -input=false \
             -var-file="environments/${ENV}/terraform.tfvars" || true
 
+  # ============================
+  # Build & Push
+  # ============================
   build-and-push:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
@@ -233,7 +241,7 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
 
-      # Subir SARIF solo cuando NO es PR desde fork, y con permisos adecuados
+      # Subir SARIF solo cuando NO es PR desde fork
       - name: Upload Trivy results
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
@@ -242,8 +250,11 @@ jobs:
 
       - name: Skip SARIF upload (fork PR)
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        run: echo "⏭️  PR desde fork: se omite upload de SARIF por permisos."
+        run: 'echo "PR desde fork: se omite upload de SARIF por permisos."'
 
+  # ============================
+  # Plan
+  # ============================
   terraform-plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
@@ -318,6 +329,9 @@ jobs:
             echo "- O haz push a main/develop para deploy automático"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ============================
+  # Apply
+  # ============================
   terraform-apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
@@ -354,7 +368,7 @@ jobs:
       - name: Terraform Apply
         run: |
           ENV=${{ inputs.environment || 'development' }}
-          terraform apply -input=false -auto-approve tfplan-${_ENV}
+          terraform apply -input=false -auto-approve tfplan-${ENV}
 
       - name: Get Terraform Outputs
         id: outputs
@@ -398,6 +412,9 @@ jobs:
             fi
           fi
 
+  # ============================
+  # Destroy
+  # ============================
   terraform-destroy:
     name: Terraform Destroy
     runs-on: ubuntu-latest
