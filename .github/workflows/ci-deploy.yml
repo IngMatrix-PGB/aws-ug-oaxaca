@@ -67,11 +67,21 @@ jobs:
           dockerfile: docker/Dockerfile
           failure-threshold: warning
 
-      - name: Lint Shell Scripts
-        uses: azohra/shell-linter@v1.0.2
-        with:
-          path: "docker/*.sh"
-          shell: bash
+      # ---------- Opción A: ShellCheck instalado directamente ----------
+      - name: Lint Shell Scripts (ShellCheck)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y shellcheck
+          shopt -s nullglob || true
+          files=(docker/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No shell scripts under docker/; skipping."
+            exit 0
+          fi
+          shellcheck --version
+          shellcheck -S warning "${files[@]}"
 
       - name: Validate Terraform
         uses: hashicorp/setup-terraform@v3
@@ -133,9 +143,6 @@ jobs:
         run: |
           cd terraform
           ENV=${{ inputs.environment || 'development' }}
-          
-          # Aplicar solo el recurso ECR si no existe
-          # Esto asegura que ECR esté disponible antes de build/push
           terraform apply \
             -target=module.infrastructure.aws_ecr_repository.this \
             -target=module.infrastructure.aws_ecr_lifecycle_policy.this \
@@ -216,8 +223,6 @@ jobs:
           set -e
           # Esperar a que la imagen esté disponible
           sleep 5
-          
-          # Obtener el digest más reciente
           IMAGE_DIGEST=$(aws ecr describe-images \
             --repository-name "${ECR_REPOSITORY}" \
             --image-ids imageTag=latest \
@@ -225,13 +230,11 @@ jobs:
             --output text \
             --region "${AWS_REGION}" \
             --max-items 1)
-          
           if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ] || [ "$IMAGE_DIGEST" = "null" ]; then
             echo "❌ No se pudo resolver el digest de la imagen"
             aws ecr describe-images --repository-name "${ECR_REPOSITORY}" --region "${AWS_REGION}"
             exit 1
           fi
-          
           IMAGE_URI_DIGEST="${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
           echo "IMAGE_URI_DIGEST=${IMAGE_URI_DIGEST}" >> $GITHUB_ENV
           echo "IMAGE_URI_DIGEST=${IMAGE_URI_DIGEST}" >> $GITHUB_OUTPUT
@@ -294,23 +297,18 @@ jobs:
         run: |
           cd terraform
           ENV=${{ inputs.environment || 'development' }}
-          
-          # Usar imagen por digest si está disponible
           IMAGE_VAR=""
           if [ -n "${{ env.IMAGE_URI_DIGEST }}" ]; then
             IMAGE_VAR="-var docker_image=${{ env.IMAGE_URI_DIGEST }}"
           fi
-          
           terraform plan \
             -input=false \
             -var-file="environments/${ENV}/terraform.tfvars" \
             $IMAGE_VAR \
             -out=tfplan-${ENV} \
             -detailed-exitcode
-          
           PLAN_EXIT_CODE=$?
           echo "plan-exists=true" >> $GITHUB_OUTPUT
-          
           if [ $PLAN_EXIT_CODE -eq 1 ]; then
             echo "❌ Error en terraform plan"
             exit 1
@@ -352,8 +350,6 @@ jobs:
     if: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')) || inputs.action == 'deploy' }}
     environment: 
       name: ${{ inputs.environment || 'development' }}
-      # Opcional: Requiere aprobación para producción
-      # url: https://github.com/${{ github.repository }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -415,9 +411,9 @@ jobs:
             echo ""
             echo "### 🧪 Verificación"
             echo "Ejecuta para verificar el despliegue:"
-            echo "\`\`\`bash"
-            echo "curl -I http://${{ steps.outputs.outputs.ec2_ip }}"
-            echo "\`\`\`"
+            echo "\`\`\`bash
+            curl -I http://${{ steps.outputs.outputs.ec2_ip }}
+            \`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Health Check
@@ -484,4 +480,3 @@ jobs:
             echo ""
             echo "⚠️ **Nota**: Los datos de RDS han sido eliminados. Asegúrate de tener backups si son necesarios."
           } >> "$GITHUB_STEP_SUMMARY"
-
