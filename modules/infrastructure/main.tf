@@ -6,7 +6,6 @@ terraform {
   }
 }
 
-
 # ============================================================================
 # Locals
 # ============================================================================
@@ -51,7 +50,6 @@ locals {
   })
   user_data_b64 = base64encode(local.user_data_raw)
 }
-
 
 # ============================================================================
 # Data Sources
@@ -135,7 +133,6 @@ resource "aws_security_group" "ec2_sg" {
     Name = "${local.base_name}-ec2-sg"
   })
 }
-
 module "rds_sg" {
   source  = "terraform-aws-modules/security-group/aws"
   version = "~> 5.0"
